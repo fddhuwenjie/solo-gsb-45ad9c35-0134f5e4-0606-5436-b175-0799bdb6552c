@@ -19,13 +19,15 @@
   - 一组**修正预览**（把落败名降级为别名的 rename / 补标签的 add-label），
     仅供前端预览与回填，审计本身不修改路由，也不回写任何配置。
 
-跨路由串线**与名签完全解耦**：判定只依据路由规划与物理连通——
-每条已规划路由的信号源即其源端口；同一源端口的路由天然同源；源端口在
-有向信号流图（设备内部 in→out、生效常态 上→下、跳线 from→to）上同属一个
-强连通分量的合并为一个独立源；能被其他源沿信号方向到达的源（如调音台
-混合输出）不是独立源，其路由按上游独立源归属。同一无向物理分量内出现
-两个互不衍生的独立源即报串线（覆盖设备内部混合与半常态并送汇合），
-**不提供可消警的改名操作**，只有调整路由规划或物理连通才能消除。
+跨路由串线**与名签完全解耦**：判定只依据路由规划与物理连通。每条已规划
+路由的信号源即其源端口；同一源端口的路由天然同源。源端口在有向信号流图
+（设备内部 in→out、生效常态 上→下、跳线 from→to）上同属一个强连通分量
+（反馈环 SCC）的合并为一路。在此基础上，审计还会从每个路由源沿信号方向
+**反向追溯**设备内部、生效常态与跳线的共同上游：多个输出端口（如同一台
+多输出设备的两个输出、或被同一信号推动的常态/跳线分支）若都从同一个
+上游终源 SCC 衍生，则它们只是该独立源的同源分支，归为同一来源，不计串线；
+只有反向终源互不相同（真正的多源混合、半常态并送汇合）时才报串线。
+串线**不提供可消警的改名操作**，只有调整路由规划或物理连通才能消除。
 """
 
 from collections import defaultdict, deque
@@ -386,7 +388,9 @@ def build_signal_digraph(plan):
     """有向信号流图：设备内部 in→out、生效常态 上→下、跳线 from→to。
 
     与 solver.detect_loops 使用同一组有向边，用于追溯路由信号源：
-    源端口若能沿信号方向到达另一源端口，后者就不是独立信号源。
+    先按强连通分量合并互达的源端口（反馈环），再沿有向边**反向**追溯到
+    入度为 0 的终源 SCC——共享同一终源的多个源端口只是同源分支，不构成
+    跨路由串线（见 trace_signal_origins）。
     返回 succ: {port: {port, ...}}（含全部端口节点）。
     """
     solver = plan["solver"]
@@ -404,6 +408,45 @@ def build_signal_digraph(plan):
     for port in solver.port_dir:
         succ.setdefault(port, set())
     return succ
+
+
+def trace_signal_origins(succ, plan, sccs):
+    """从每个 SCC 沿信号方向**反向追溯**上游终源（设备内部 / 常态 / 跳线）。
+
+    缩点图（condensation）上的“终源 SCC”＝没有任何入边的 SCC：信号只能从
+    这里起源、没有更上游可追。只含输入端口的终源 SCC 是“悬空输入”（背板
+    没接线的设备输入），它本身不产生信号、不计入终源；因此一个源 SCC 追不
+    到任何输出型终源时，意味着它挂在一条完全无驱动的悬空总线上，其归属由
+    调用方按无向物理分量另行归组。
+
+    返回：
+      scc_of     端口 → SCC 编号
+      origins_of SCC → frozenset(输出型终源 SCC 编号)（可空：无驱动总线）
+    """
+    scc_of = {p: i for i, comp in enumerate(sccs) for p in comp}
+    comp_pred = [set() for _ in sccs]
+    for u, outs in succ.items():
+        for v in outs:
+            if scc_of[u] != scc_of[v]:
+                comp_pred[scc_of[v]].add(scc_of[u])
+
+    port_dir = plan["solver"].port_dir
+
+    origins_of = {}
+    for cid in range(len(sccs)):
+        seen = {cid}
+        q = deque([cid])
+        while q:
+            u = q.popleft()
+            for v in comp_pred[u]:
+                if v not in seen:
+                    seen.add(v)
+                    q.append(v)
+        origins_of[cid] = frozenset(
+            a for a in seen
+            if not comp_pred[a]
+            and any(port_dir[p][1] == "out" for p in sccs[a]))
+    return scc_of, origins_of
 
 
 def _union_find(nodes):
@@ -687,90 +730,143 @@ def audit_signals(config, labels_raw):
     # ---- 4) 跨路由串线：独立信号源的已规划路由汇于同一物理分量 ----------
     # 判定与名签（规范名/别名）完全解耦，只追溯信号源与路由归属：
     #  - 同一源端口的多条路由天然同源；
-    #  - 源端口在有向信号流图上同属一个强连通分量（如反馈环两端）合并为
-    #    一个独立源；
-    #  - 能被其他源沿信号方向到达的源（如调音台的混合输出）不是独立源，
-    #    其路由按可到达它的上游独立源归属；
-    #  - 同一无向物理分量内出现两个互不衍生的独立源 → 跨路由串线
-    #    （设备内部混合、半常态并送汇合均覆盖）。改名/改别名不会改变归属，
-    #    只有调整路由规划或物理连通才能消除，因此不提供任何 rename 修正。
+    #  - 源端口在有向信号流图上同属一个强连通分量（如反馈环两端）合并为一路；
+    #  - 从每个路由源 SCC 沿信号方向**反向追溯**（设备内部 in→out 的反向、
+    #    生效常态 上→下的反向、跳线 from→to 的反向）到全部“终源 SCC”
+    #    （缩点图入度为 0、且含输出端口）：多个源 SCC 共享同一终源即同一
+    #    真实独立信号的**同源分支**（典型：一个真实信号进入多输出设备后，
+    #    从两个输出端口分别建路由；或被常态/跳线推动出的多条支路），归为
+    #    一个来源，不增加串线计数；
+    #  - 一个源 SCC 可同时由多个不同终源衍生（设备内部混合、半常态并送），
+    #    其路由归属全部终源（下游混合点）；
+    #  - 同一无向物理分量内出现两个不同终源 → 跨路由串线。改名/改别名不会
+    #    改变归属，只有调整路由规划或物理连通才能消除，因此不提供 rename。
     dsucc = build_signal_digraph(plan)
     planned_routes = [(info["index"], info["source"])
                       for info in plan["planned"] if info["ok"]]
     source_ports = {src for _, src in planned_routes}
 
     sccs = _tarjan_scc(dsucc.keys(), dsucc)
-    scc_of = {p: i for i, comp in enumerate(sccs) for p in comp}
-    comp_succ = [set() for _ in sccs]
-    for u, outs in dsucc.items():
-        for v in outs:
-            if scc_of[u] != scc_of[v]:
-                comp_succ[scc_of[u]].add(scc_of[v])
+    scc_of, origins_of = trace_signal_origins(dsucc, plan, sccs)
     source_sccs = {scc_of[p] for p in source_ports}
-
-    def reachable_components(start):
-        """有向缩点图上从 start 可达的全部分量（可经非源分量中转）。"""
-        seen = {start}
-        q = deque([start])
-        while q:
-            u = q.popleft()
-            for v in comp_succ[u]:
-                if v not in seen:
-                    seen.add(v)
-                    q.append(v)
-        return seen
-
-    # 源 SCC → 沿信号方向可达（含自身）的全部源 SCC
-    reachable_sources = {s: (reachable_components(s) & source_sccs)
-                         for s in source_sccs}
-    # 独立源（根源 SCC）：没有任何其他源 SCC 能沿信号方向到达它
-    root_sccs = {s for s in source_sccs
-                 if not any(t != s and s in reachable_sources[t]
-                            for t in source_sccs)}
-    # 每个源 SCC 归属的独立源集合（自身为根时包含自身；混合点可归属多个）
-    owners_of = {s: {t for t in root_sccs if s in reachable_sources[t]}
-                 for s in source_sccs}
 
     routes_from = defaultdict(list)          # 源端口 → 从该端口出发的路由
     for idx, src in planned_routes:
         routes_from[src].append(idx)
 
-    def group_payload(cid):
-        ports = sorted(p for p in source_ports if scc_of[p] == cid)
-        return {"port": ports[0], "ports": ports,
-                "routes": sorted(i for p in ports for i in routes_from[p])}
+    def scc_ports(cid):
+        """SCC 内的源端口（仅路由源），字典序。"""
+        return sorted(p for p in source_ports if scc_of[p] == cid)
 
-    # 独立源按其源端口所在的无向物理分量归组（有向可达必在同一无向分量内）
-    roots_by_comp = defaultdict(set)
-    for cid in root_sccs:
-        roots_by_comp[find(group_payload(cid)["port"])].add(cid)
+    def origin_ports(cid):
+        """终源 SCC 内的全部输出端口（字典序），即便那里没有直接建路由。"""
+        return sorted(p for p in sccs[cid] if solver.port_dir[p][1] == "out")
+
+    # 每个源 SCC 的“来源键”：
+    #  唯一终源      → ("origin", frozenset({该终源}))：该独立源的一个分支；
+    #  多个不同终源  → ("mix", frozenset(终源集))：真正的多源混合点；
+    #  追不到任何输出终源（无驱动设备总线）→ ("dead", frozenset({物理分量根}))：
+    #     没有任何真实信号源可追，同一无向物理分量内的无驱动分支同属一条
+    #     悬空（等电位）总线，归为同一个未接线来源；不同分量的悬空总线
+    #     互不相同。
+    def identity_of(cid, root):
+        outs = origins_of[cid]
+        if len(outs) == 1:
+            return ("origin", outs)
+        if len(outs) >= 2:
+            return ("mix", outs)
+        return ("dead", frozenset((root,)))
+
+    def origin_list(key):
+        """来源键对应的终源输出端口（跨成员 SCC 聚合，字典序稳定）。"""
+        if key[0] == "origin":
+            return origin_ports(next(iter(key[1])))
+        if key[0] == "mix":
+            return sorted({p for o in key[1] for p in origin_ports(o)})
+        return []                              # 无驱动总线：终源侧没有命名端口
+
+    # 同源分支按“来源键”归组，且只在其路由源所在的**同一无向物理分量**内
+    # 归并（有向衍生必在同一无向分量内；不同分量即便共用终源也不相关）。
+    # group: {key, kind, origin, originPorts, members[(cid, ports)], routes}
+    groups_by_comp = defaultdict(dict)
+    mix_members = []                         # (物理分量, 组, 源 SCC)
+    for cid in source_sccs:
+        members = scc_ports(cid)
+        root = find(members[0]) if members else None
+        key = identity_of(cid, root)
+        g = groups_by_comp[root].get(key)
+        if g is None:
+            kind = key[0]
+            origin = cid if kind == "origin" else None
+            g = {"key": key, "kind": kind, "origin": origin,
+                 "originPorts": origin_list(key),
+                 "members": [], "routes": []}
+            groups_by_comp[root][key] = g
+        else:
+            # 不同 SCC 可能恰有相同来源键（如混合点经不同路径并流）：
+            # 终源端口仍以来源键为准聚合，避免漏掉后加入成员携带的终源。
+            g["originPorts"] = origin_list(key)
+        g["members"].append((cid, members))
+        g["routes"].extend(i for p in members for i in routes_from[p])
+        if g["kind"] == "mix":
+            mix_members.append((root, g, cid))
+    for groups in groups_by_comp.values():
+        for g in groups.values():
+            g["members"].sort(key=lambda m: (m[1] or [""])[0])
+            g["routes"] = sorted(set(g["routes"]))
+
+    def group_payload(g):
+        # 代表端口：独立源取反向追溯到的终源输出（稳定的来源归属），
+        # 混合点 / 无驱动总线取其实际路由源端口（混合就发生在那里）。
+        member_ports = sorted({p for _, mp in g["members"] for p in mp})
+        if g["kind"] == "origin":
+            rep = g["originPorts"][0] if g["originPorts"] else (
+                member_ports[0] if member_ports else "")
+        else:
+            rep = member_ports[0] if member_ports else (
+                g["originPorts"][0] if g["originPorts"] else "")
+        return {"port": rep, "ports": member_ports,
+                "originPorts": g["originPorts"],
+                "routes": g["routes"],
+                "mixed": g["kind"] == "mix"}
 
     def desc_group(g):
-        rts = "、".join(str(i + 1) for i in g["routes"])
-        ports = "、".join(g["ports"])
-        return f"源端口 {ports} 的路由 {rts}" if rts else f"源端口 {ports}"
+        gp = group_payload(g)
+        rts = "、".join(str(i + 1) for i in gp["routes"])
+        ports = "、".join(gp["ports"])
+        head = f"源端口 {ports} 的路由 {rts}" if rts else f"源端口 {ports}"
+        if g["kind"] == "origin" and g["originPorts"] \
+                and g["originPorts"] != gp["ports"]:
+            up = "、".join(g["originPorts"])
+            head = f"{head}（反向追溯到共同上游 {up}，为同源分支）"
+        return head
 
-    for uroot, gset in roots_by_comp.items():
-        groups = sorted((group_payload(cid) for cid in gset),
-                        key=lambda g: g["port"])
-        for ai in range(len(groups)):
-            for bi in range(ai + 1, len(groups)):
-                ga, gb = groups[ai], groups[bi]
-                # 证据：两组独立源端口之间的最短无向物理路径（改名不会改变）
-                nodes, _ = shortest_path(adj, ga["ports"], gb["ports"])
+    # 独立源（非混合）组按物理分量两两配对；混合点同时归属多个独立源时，
+    # 作为下游混合点附注到对应串线条目（与旧逻辑的 downstream 语义一致）。
+    for uroot, gmap in groups_by_comp.items():
+        independents = sorted((g for g in gmap.values() if g["kind"] != "mix"),
+                              key=lambda g: group_payload(g)["port"])
+        for ai in range(len(independents)):
+            for bi in range(ai + 1, len(independents)):
+                ga, gb = independents[ai], independents[bi]
+                pa, pb = group_payload(ga), group_payload(gb)
+                # 证据：两组分支的实际路由源端口之间的最短无向物理路径
+                nodes, _ = shortest_path(adj, pa["ports"], pb["ports"])
                 if nodes is None:
                     continue
-                # 下游混合点：非独立源 SCC 同时由这两个独立源衍生
-                # （典型：两路信号进同一台设备，其混合输出再带出一条路由）
+                # 下游混合点：混合组的终源集合同时包含这两个独立源
+                a_ids, b_ids = ga["key"][1], gb["key"][1]
+                a_origin = next(iter(a_ids))
+                b_origin = next(iter(b_ids))
                 downstream = []
-                for s in source_sccs - root_sccs:
-                    own = owners_of[s]
-                    if scc_of[ga["port"]] in own and scc_of[gb["port"]] in own:
-                        g = group_payload(s)
-                        if g["routes"]:
-                            downstream.append(g)
-                downstream.sort(key=lambda g: g["port"])
-                rts_all = sorted(set(ga["routes"] + gb["routes"]
+                for root, g, cid in mix_members:
+                    if root != uroot:
+                        continue
+                    ids = g["key"][1]
+                    if a_origin in ids and b_origin in ids and g["routes"]:
+                        downstream.append(group_payload(g))
+                downstream.sort(key=lambda x: x["port"])
+                rts_all = sorted(set(pa["routes"] + pb["routes"]
                                      + [i for g in downstream for i in g["routes"]]))
                 tail = ""
                 if downstream:
@@ -783,25 +879,29 @@ def audit_signals(config, labels_raw):
                     "type": CROSSTALK, "severity": "error",
                     "title": TYPE_TITLES[CROSSTALK],
                     "message": f"独立信号源「{desc_group(ga)}」与「{desc_group(gb)}」"
-                               f"的已规划路由在同一物理连通分量汇合，两个互不衍生的"
-                               f"独立信号在该分量内等电位（覆盖设备内部混合与半常态"
-                               f"并送汇合），发生跨路由串线。改名或改别名不会改变"
-                               f"信号源归属，无法消除本报警{tail}。只能调整路由规划"
-                               f"（取消或改道相关路由）或断开它们之间的物理连通"
-                               f"（拔除跳线 / 改变常态模式 / 修改背板接线）后重新规划。",
+                               f"的已规划路由在同一物理连通分量汇合，两个反向追溯到"
+                               f"不同终源、互不衍生的独立信号在该分量内等电位（覆盖"
+                               f"设备内部混合与半常态并送汇合），发生跨路由串线。"
+                               f"改名或改别名不会改变信号源归属，无法消除本报警{tail}。"
+                               f"只能调整路由规划（取消或改道相关路由）或断开它们"
+                               f"之间的物理连通（拔除跳线 / 改变常态模式 / 修改背板"
+                               f"接线）后重新规划。",
                     "resolution": "调整路由规划或断开独立源之间的物理连通后重新规划；"
                                   "重命名规范名 / 别名不能消除串线。",
                     "component": uroot,
                     # names 沿用数组结构供排序使用，内容为与标签无关的源端口
-                    "names": sorted(ga["ports"] + gb["ports"]),
-                    "sources": [{"port": ga["port"], "ports": ga["ports"],
-                                 "routes": ga["routes"]},
-                                {"port": gb["port"], "ports": gb["ports"],
-                                 "routes": gb["routes"]}],
+                    "names": sorted(pa["ports"] + pb["ports"]),
+                    "sources": [{"port": pa["port"], "ports": pa["ports"],
+                                 "originPorts": pa["originPorts"],
+                                 "routes": pa["routes"]},
+                                {"port": pb["port"], "ports": pb["ports"],
+                                 "originPorts": pb["originPorts"],
+                                 "routes": pb["routes"]}],
                     "routes": rts_all,
-                    "routesBySource": {ga["port"]: ga["routes"],
-                                       gb["port"]: gb["routes"]},
-                    "downstream": [{"port": g["ports"][0], "ports": g["ports"],
+                    "routesBySource": {pa["port"]: pa["routes"],
+                                       pb["port"]: pb["routes"]},
+                    "downstream": [{"port": g["port"], "ports": g["ports"],
+                                    "originPorts": g["originPorts"],
                                     "routes": g["routes"]} for g in downstream],
                     "evidence": evidence_items(nodes, adj, plan,
                                                _node_label_map(decls)),
