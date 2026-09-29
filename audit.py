@@ -22,9 +22,14 @@
 跨路由串线**与名签完全解耦**：判定只依据路由规划与物理连通——
 每条已规划路由的信号源即其源端口；同一源端口的路由天然同源；源端口在
 有向信号流图（设备内部 in→out、生效常态 上→下、跳线 from→to）上同属一个
-强连通分量的合并为一个独立源；能被其他源沿信号方向到达的源（如调音台
-混合输出）不是独立源，其路由按上游独立源归属。同一无向物理分量内出现
-两个互不衍生的独立源即报串线（覆盖设备内部混合与半常态并送汇合），
+强连通分量的合并为一个源；审计还从路由源沿信号反方向（设备内部 out→in、
+常态 下→上、跳线 to→from）**反向追溯共同上游**：能被上游端口到达的源
+（如同一台多输出设备分出的两路输出、调音台的混合输出）不是独立源，
+其路由按共同上游归属——同源多输出分支由此归并为一个来源，不计串线。
+反向追溯的终点（缩点图上没有任何上游、且含有设备输出端口的 SCC，如话筒
+输出）才是独立信号源；只含悬空输入端口的终点不产生信号，仅用于把同源
+分支归并到共同上游，不参与串线判定。同一无向物理分量内出现两个互不
+衍生的独立源即报串线（覆盖设备内部混合与半常态并送汇合），
 **不提供可消警的改名操作**，只有调整路由规划或物理连通才能消除。
 """
 
@@ -687,10 +692,14 @@ def audit_signals(config, labels_raw):
     # ---- 4) 跨路由串线：独立信号源的已规划路由汇于同一物理分量 ----------
     # 判定与名签（规范名/别名）完全解耦，只追溯信号源与路由归属：
     #  - 同一源端口的多条路由天然同源；
-    #  - 源端口在有向信号流图上同属一个强连通分量（如反馈环两端）合并为
-    #    一个独立源；
-    #  - 能被其他源沿信号方向到达的源（如调音台的混合输出）不是独立源，
-    #    其路由按可到达它的上游独立源归属；
+    #  - 源端口在有向信号流图上同属一个强连通分量（如反馈环两端）合并为一个源；
+    #  - 从路由源继续沿设备内部、生效常态与跳线**反向**追溯共同上游：能被
+    #    上游端口沿信号方向到达的源（如同一台多输出设备分出的两路输出、
+    #    调音台的混合输出）不是独立源，其路由按共同上游归属——同源多输出
+    #    分支由此归并为一个来源，不再计串线；
+    #  - 反向追溯的终点（缩点图上没有任何上游、且含有设备输出端口的 SCC，
+    #    如话筒输出）才是独立信号源；只含悬空输入端口的终点不产生信号，
+    #    仅用于把同源分支归并到共同上游，不参与串线判定；
     #  - 同一无向物理分量内出现两个互不衍生的独立源 → 跨路由串线
     #    （设备内部混合、半常态并送汇合均覆盖）。改名/改别名不会改变归属，
     #    只有调整路由规划或物理连通才能消除，因此不提供任何 rename 修正。
@@ -702,11 +711,34 @@ def audit_signals(config, labels_raw):
     sccs = _tarjan_scc(dsucc.keys(), dsucc)
     scc_of = {p: i for i, comp in enumerate(sccs) for p in comp}
     comp_succ = [set() for _ in sccs]
+    comp_pred = [set() for _ in sccs]
     for u, outs in dsucc.items():
         for v in outs:
             if scc_of[u] != scc_of[v]:
                 comp_succ[scc_of[u]].add(scc_of[v])
+                comp_pred[scc_of[v]].add(scc_of[u])
     source_sccs = {scc_of[p] for p in source_ports}
+    source_ports_by_scc = defaultdict(list)
+    for p in source_ports:
+        source_ports_by_scc[scc_of[p]].append(p)
+
+    # 反向追溯共同上游：路由源 SCC 沿信号反方向（设备内部 out→in、
+    # 常态 下→上、跳线 to→from）可达的全部祖先 SCC
+    ancestors = set(source_sccs)
+    q = deque(source_sccs)
+    while q:
+        u = q.popleft()
+        for p in comp_pred[u]:
+            if p not in ancestors:
+                ancestors.add(p)
+                q.append(p)
+    # 独立信号源（根源 SCC）：祖先中没有任何其他上游（缩点图入度为 0）、
+    # 且含有设备输出端口（信号只能由设备输出产生）者——同源多输出分支共享
+    # 同一批祖先，归并后只剩一个独立源。只含悬空输入端口的根源不产生信号，
+    # 不参与串线判定（否则未接线的设备输入会被误当成独立信号源）。
+    root_sccs = {s for s in ancestors
+                 if not comp_pred[s]
+                 and any(solver.port_dir[p][1] == "out" for p in sccs[s])}
 
     def reachable_components(start):
         """有向缩点图上从 start 可达的全部分量（可经非源分量中转）。"""
@@ -720,39 +752,42 @@ def audit_signals(config, labels_raw):
                     q.append(v)
         return seen
 
-    # 源 SCC → 沿信号方向可达（含自身）的全部源 SCC
-    reachable_sources = {s: (reachable_components(s) & source_sccs)
-                         for s in source_sccs}
-    # 独立源（根源 SCC）：没有任何其他源 SCC 能沿信号方向到达它
-    root_sccs = {s for s in source_sccs
-                 if not any(t != s and s in reachable_sources[t]
-                            for t in source_sccs)}
-    # 每个源 SCC 归属的独立源集合（自身为根时包含自身；混合点可归属多个）
-    owners_of = {s: {t for t in root_sccs if s in reachable_sources[t]}
-                 for s in source_sccs}
+    # 独立源沿信号方向统辖（含自身）的全部路由源 SCC → 路由归属
+    # （混合点的路由可同时归属多个独立源）
+    feeds_sources = {t: (reachable_components(t) & source_sccs)
+                     for t in root_sccs}
 
     routes_from = defaultdict(list)          # 源端口 → 从该端口出发的路由
     for idx, src in planned_routes:
         routes_from[src].append(idx)
 
     def group_payload(cid):
-        ports = sorted(p for p in source_ports if scc_of[p] == cid)
+        """独立源分组：SCC 内全部端口 + 归属该独立源的全部已规划路由。"""
+        ports = sorted(sccs[cid])
+        owned = sorted({i for s in feeds_sources[cid]
+                        for p in source_ports_by_scc[s]
+                        for i in routes_from[p]})
+        return {"cid": cid, "port": ports[0], "ports": ports, "routes": owned}
+
+    def mixed_payload(cid):
+        """下游混合点分组：SCC 内的路由源端口 + 从这些端口出发的路由。"""
+        ports = sorted(source_ports_by_scc[cid])
         return {"port": ports[0], "ports": ports,
                 "routes": sorted(i for p in ports for i in routes_from[p])}
 
-    # 独立源按其源端口所在的无向物理分量归组（有向可达必在同一无向分量内）
-    roots_by_comp = defaultdict(set)
+    # 独立源按其端口所在的无向物理分量归组（有向可达必在同一无向分量内）
+    roots_by_comp = defaultdict(list)
     for cid in root_sccs:
-        roots_by_comp[find(group_payload(cid)["port"])].add(cid)
+        g = group_payload(cid)
+        roots_by_comp[find(g["port"])].append(g)
 
     def desc_group(g):
         rts = "、".join(str(i + 1) for i in g["routes"])
         ports = "、".join(g["ports"])
         return f"源端口 {ports} 的路由 {rts}" if rts else f"源端口 {ports}"
 
-    for uroot, gset in roots_by_comp.items():
-        groups = sorted((group_payload(cid) for cid in gset),
-                        key=lambda g: g["port"])
+    for uroot, groups in roots_by_comp.items():
+        groups.sort(key=lambda g: g["port"])
         for ai in range(len(groups)):
             for bi in range(ai + 1, len(groups)):
                 ga, gb = groups[ai], groups[bi]
@@ -760,13 +795,13 @@ def audit_signals(config, labels_raw):
                 nodes, _ = shortest_path(adj, ga["ports"], gb["ports"])
                 if nodes is None:
                     continue
-                # 下游混合点：非独立源 SCC 同时由这两个独立源衍生
+                # 下游混合点：非独立源的路由源 SCC 同时由这两个独立源并流而成
                 # （典型：两路信号进同一台设备，其混合输出再带出一条路由）
                 downstream = []
                 for s in source_sccs - root_sccs:
-                    own = owners_of[s]
-                    if scc_of[ga["port"]] in own and scc_of[gb["port"]] in own:
-                        g = group_payload(s)
+                    if s in feeds_sources[ga["cid"]] \
+                            and s in feeds_sources[gb["cid"]]:
+                        g = mixed_payload(s)
                         if g["routes"]:
                             downstream.append(g)
                 downstream.sort(key=lambda g: g["port"])
